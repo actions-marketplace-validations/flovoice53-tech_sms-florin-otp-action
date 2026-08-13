@@ -1,0 +1,119 @@
+name: "Get SMS/OTP Code (sms-florin)"
+description: "Rent a real UK phone number and wait for an SMS/OTP verification code, for use in CI/E2E test pipelines."
+author: "flovoice53-tech"
+branding:
+  icon: "message-square"
+  color: "green"
+
+inputs:
+  api-key:
+    description: "Your sms-florin API key (create one at https://flo-voice1.com/api-access). Pass it via a GitHub Actions secret, never hardcode it."
+    required: true
+  service-slug:
+    description: 'Which service to rent a number for (e.g. "whatsapp", "telegram", "google"). See https://flo-voice1.com/rent for the full list of slugs.'
+    required: true
+  period:
+    description: '"instant" (one code, ~10 min window) or "monthly". Almost always "instant" for CI.'
+    required: false
+    default: "instant"
+  timeout-seconds:
+    description: "Give up and fail the step if no SMS arrives within this many seconds."
+    required: false
+    default: "120"
+  poll-interval-seconds:
+    description: "How often to check for the SMS while waiting."
+    required: false
+    default: "5"
+  base-url:
+    description: "API base URL. Override only for testing against a different environment."
+    required: false
+    default: "https://flo-voice1.com/api/v1"
+
+outputs:
+  rental-id:
+    description: "The id of the created rental."
+    value: ${{ steps.rent.outputs.rental_id }}
+  phone-number:
+    description: "The rented phone number, e.g. +447700900123."
+    value: ${{ steps.rent.outputs.phone_number }}
+  sms-sender:
+    description: "The sender field of the first SMS received."
+    value: ${{ steps.poll.outputs.sms_sender }}
+  sms-body:
+    description: "The full raw text of the first SMS received. Extract the actual code from this yourself (formats vary per service) — this action deliberately doesn't guess a regex, since a wrong guess would be worse than no guess."
+    value: ${{ steps.poll.outputs.sms_body }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Rent a number
+      id: rent
+      shell: bash
+      run: |
+        set -euo pipefail
+        response=$(curl -sS -w "\n%{http_code}" -X POST "${{ inputs.base-url }}/rentals" \
+          -H "Authorization: Bearer ${{ inputs.api-key }}" \
+          -H "Content-Type: application/json" \
+          -d "{\"serviceSlug\":\"${{ inputs.service-slug }}\",\"period\":\"${{ inputs.period }}\"}")
+        http_code=$(echo "$response" | tail -n1)
+        body=$(echo "$response" | sed '$d')
+
+        if [ "$http_code" != "201" ]; then
+          echo "::error::Failed to rent a number (HTTP $http_code): $body"
+          exit 1
+        fi
+
+        rental_id=$(echo "$body" | jq -r '.rentalId')
+        echo "rental_id=$rental_id" >> "$GITHUB_OUTPUT"
+        echo "Rented, rental id: $rental_id"
+
+    - name: Wait for the SMS
+      id: poll
+      shell: bash
+      run: |
+        set -euo pipefail
+        deadline=$(( $(date +%s) + ${{ inputs.timeout-seconds }} ))
+
+        while true; do
+          response=$(curl -sS -w "\n%{http_code}" "${{ inputs.base-url }}/rentals/${{ steps.rent.outputs.rental_id }}" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}")
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" != "200" ]; then
+            echo "::error::Failed to check rental status (HTTP $http_code): $body"
+            exit 1
+          fi
+
+          phone_number=$(echo "$body" | jq -r '.phoneNumber // empty')
+          if [ -n "$phone_number" ]; then
+            echo "phone_number=$phone_number" >> "$GITHUB_OUTPUT"
+          fi
+
+          message_count=$(echo "$body" | jq '.messages | length')
+          if [ "$message_count" -gt 0 ]; then
+            sms_body=$(echo "$body" | jq -r '.messages[0].body')
+            sms_sender=$(echo "$body" | jq -r '.messages[0].sender')
+            {
+              echo "sms_body<<SMS_BODY_EOF"
+              echo "$sms_body"
+              echo "SMS_BODY_EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "sms_sender=$sms_sender" >> "$GITHUB_OUTPUT"
+            echo "SMS received from $sms_sender"
+            exit 0
+          fi
+
+          status=$(echo "$body" | jq -r '.status')
+          if [ "$status" = "expired" ]; then
+            echo "::error::Rental expired before an SMS arrived."
+            exit 1
+          fi
+
+          if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "::error::Timed out after ${{ inputs.timeout-seconds }}s waiting for an SMS."
+            exit 1
+          fi
+
+          sleep "${{ inputs.poll-interval-seconds }}"
+        done
